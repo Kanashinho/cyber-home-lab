@@ -1,104 +1,157 @@
-# Laboratório Isolado de Cibersegurança — Wazuh, Ubuntu Server e Metasploitable
+# Laboratório Isolado de Cibersegurança — Wazuh (SIEM), Ubuntu Server e Metasploitable
 
-Este repositório documenta a montagem do meu primeiro laboratório isolado de cibersegurança, usando Wazuh (SIEM), Ubuntu Server e Metasploitable, com acesso via SSH a partir de um notebook Ubuntu.
+Este repositório documenta a arquitetura, implementação e resolução de problemas (Troubleshooting) do meu laboratório isolado de cibersegurança, utilizando Wazuh (SIEM), Ubuntu Server e Metasploitable, com operação remota via SSH a partir de um notebook dedicado.
 
 ## Objetivo
 
-Criar uma rede isolada para praticar conceitos de SOC, monitoramento de eventos e análise de segurança, sem expor nada à internet.
+Construir um ambiente controlado e segmentado para praticar operações de SOC (Security Operations Center), monitoramento de logs, detecção de intrusão e testes de invasão sem expor ativos vulneráveis à internet.
 
-## Arquitetura do laboratório
+## Arquitetura e Topologia de Rede
 
 ```text
-[Notebook Ubuntu] --cabo Ethernet + adaptador USB--> [PC principal com VMs]
-                                                          ├── Wazuh (OVA oficial)
-                                                          ├── Ubuntu Server (alvo)
-                                                          └── Metasploitable (alvo legado)
+[Notebook Ubuntu (Atacante/Analista)]
+       │  Interface: eno2 (10.0.0.2/30)
+       │  Conexão física: Cabo Ethernet + Adaptador USB GbE
+       ▼
+[PC Principal - Windows Host (Roteador L3 / NetNat)]
+       ├── Interface USB GbE: 10.0.0.1/30 (Forwarding Enabled)
+       └── VirtualBox Host-Only Adapter: 192.168.56.1/24
+                │
+                ├── Wazuh SIEM (OVA Oficial)
+                ├── Ubuntu Server (Alvo Monitorado)
+                └── Metasploitable 2 (Alvo Legado)
 ```
 
-- **PC principal (Windows, 16GB RAM):** hospeda as VMs no Oracle VirtualBox.
-- **Notebook Ubuntu:** máquina de ataque, conectada por cabo Ethernet via adaptador USB.
-- **Rede:** modo *host-only*, totalmente isolada da internet.
-- **Acesso:** SSH a partir do notebook para todas as VMs.
+> **Nota de OpSec:** Todos os endereços IP documentados neste repositório são ilustrativos (RFC 1918) para fins didáticos.
 
-## Configuração de rede no Wazuh
+- **PC Principal (Windows, 16GB RAM):** Hospeda as VMs no Oracle VirtualBox e atua como roteador de Camada 3 entre o enlace físico dedicado e o switch virtual *Host-Only*.
+- **Notebook Ubuntu:** Máquina de operação e ataque conectada fisicamente via cabo Ethernet e adaptador USB.
+- **Isolamento:** As máquinas virtuais comunicam-se na rede *Host-Only*, isoladas da rede doméstica principal.
 
-Na VM do Wazuh, adicionei dois adaptadores de rede no VirtualBox:
+---
 
-- **Adaptador 1 — Host-only:** para comunicação na rede isolada.
-- **Adaptador 2 — NAT:** para acesso à internet durante a instalação e atualizações.
+## Diário de Troubleshooting e Engenharia de Rede
 
-### Problema encontrado: IP duplicado no eth0
+Durante a evolução do laboratório, enfrentei e solucionei quatro desafios reais de infraestrutura e redes:
 
-Ao configurar o IP e a máscara no arquivo `ifcfg-eth0`, percebi que o adaptador `eth0` estava com dois IPs simultaneamente.
+### 1. Roteamento Camada 3 e Assimetria de Rota entre Notebook e VMs
 
-Criei então um arquivo separado, `ifcfg-eth1`, para o segundo adaptador, mas o problema persistiu.
+**Problema:** O acesso SSH funcionava a partir do PC Principal, mas apresentava `100% packet loss` e falha de resolução ARP (`FAILED`) a partir do notebook conectado via cabo Ethernet USB.
 
-### Solução
+**Diagnóstico:**
+1. O adaptador *Host-Only* do VirtualBox opera como um switch virtual isolado no host, sem ponte de Camada 2 automática para a placa física USB.
+2. Após alinhar o enlace físico em uma sub-rede ponto-a-ponto dedicada (`/30`) e ativar o encaminhamento de pacotes no Windows (`IPEnableRouter`), os pacotes ICMP chegavam às VMs, mas o retorno era perdido por **assimetria de rota** (as VMs não possuíam rota de retorno para a sub-rede `/30` do cabo).
 
-Limpei os IPs extras do `eth0` e reiniciei o serviço de rede:
+**Solução:**
+- **No Host Windows:** Ativação do roteamento IP no registro (`IPEnableRouter = 1`), habilitação do `Forwarding` nas interfaces via PowerShell e configuração de tradução de endereços com `New-NetNat` para a sub-rede `/30`, além de regras específicas de Firewall:
+  ```powershell
+  Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+  Set-NetIPInterface -InterfaceAlias "Ethernet 3","Ethernet 2" -Forwarding Enabled
+  New-NetNat -Name "Lab_HostOnly_NAT" -InternalIPInterfaceAddressPrefix 10.0.0.0/30
+  ```
+- **No Notebook Ubuntu:** Padronização da persistência de rede via **Netplan** (`/etc/netplan/01-network-manager-all.yaml`) definindo explicitamente o `renderer: NetworkManager`, IP estático `/30` na interface cabeada e rota estática para a rede das VMs (`192.168.56.0/24 via 10.0.0.1`), eliminando conflitos no boot com o `systemd-networkd`:
+  ```yaml
+  network:
+    version: 2
+    renderer: NetworkManager
+    ethernets:
+      eno2:
+        dhcp4: no
+        addresses:
+          - 10.0.0.2/30
+        routes:
+          - to: 192.168.56.0/24
+            via: 10.0.0.1
+  ```
 
+---
+
+### 2. Inicialização da Interface `eth1` e Acesso ao Dashboard no Wazuh (OVA)
+
+**Problema:** Perda recorrente de acesso SSH e ao Dashboard web do Wazuh após reiniciar a VM. Embora o arquivo `/etc/sysconfig/network-scripts/ifcfg-eth1` estivesse configurado com `ONBOOT=yes`, o script não subia o IP do laboratório durante o boot, exigindo ativação manual via terminal local da VM. Além disso, o sistema operacional da OVA oficial não utiliza `NetworkManager`.
+
+**Diagnóstico:**
+Sistemas baseados em CentOS/Amazon Linux utilizados na OVA do Wazuh dependem do serviço legado `network.service` e sofrem interferência do `cloud-init`, que pode redefinir configurações de interfaces secundárias se o endereço físico (MAC Address) não estiver explicitamente vinculado ao script de boot.
+
+**Solução:**
+1. Vinculação forçada do MAC Address (`HWADDR`) e desativação do controle pelo NetworkManager diretamente no `/etc/sysconfig/network-scripts/ifcfg-eth1`:
+   ```ini
+   DEVICE=eth1
+   BOOTPROTO=static
+   ONBOOT=yes
+   NM_CONTROLLED=no
+   HWADDR=08:00:27:XX:XX:XX
+   IPADDR=192.168.56.10
+   NETMASK=255.255.255.0
+   ```
+2. Bloqueio de sobrescrita de rede pelo `cloud-init` criando `/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg`:
+   ```yaml
+   network: {config: disabled}
+   ```
+3. Habilitação persistente do serviço legado de rede no boot:
+   ```bash
+   sudo systemctl enable network
+   sudo systemctl restart network
+   ```
+
+---
+
+### 3. Conflito de IP Duplicado na Interface `eth0`
+
+**Problema:** Ao configurar os adaptadores no Wazuh (Adaptador 1 Host-Only e Adaptador 2 NAT), a interface `eth0` reteve dois endereços IP simultaneamente.
+
+**Solução:** Limpeza da tabela de endereços da interface e reinicialização do serviço de rede:
 ```bash
 sudo ip addr flush dev eth0
 sudo systemctl restart network
 ```
 
-Depois disso, a conexão via SSH do notebook funcionou corretamente.
+---
 
-## Compatibilidade SSH com Metasploitable
+### 4. Compatibilidade Criptográfica SSH com Sistemas Legados (Metasploitable)
 
-A VM Metasploitable é de 2008 e meu notebook roda uma versão moderna do Ubuntu. Na tentativa de conectar via SSH, o servidor recusava a conexão por incompatibilidade de algoritmos de criptografia e troca de chaves.
+**Problema:** O cliente OpenSSH moderno do Ubuntu recusava conexão com o Metasploitable (2008) por depreciação dos algoritmos antigos de troca de chaves e cifras.
 
-### Solução
-
-Reativei algoritmos legados diretamente no comando SSH:
-
-```bash
-ssh -oKexAlgorithms=+diffie-hellman-group1-sha1 \
-    -oCiphers=+aes128-cbc \
-    -oHostKeyAlgorithms=+ssh-rsa \
-    usuario@192.168.56.x
-```
-
-> **Nota:** os IPs acima são exemplos. Use os IPs reais da sua rede isolada.
-
-## Atalhos com SSH config
-
-Para facilitar o acesso, criei o arquivo `~/.ssh/config`:
+**Solução:** Habilitação seletiva dos algoritmos legados para o host específico e criação de atalhos no `~/.ssh/config`:
 
 ```text
 Host wazuh
-    HostName 192.168.56.x
-    User usuario
+    HostName 192.168.56.10
+    User wazuh-user
 
 Host alvo
-    HostName 192.168.56.x
+    HostName 192.168.56.11
     User usuario
 
 Host metasploitable
-    HostName 192.168.56.x
+    HostName 192.168.56.12
     User msfadmin
+    KexAlgorithms +diffie-hellman-group1-sha1
+    Ciphers +aes128-cbc
+    HostKeyAlgorithms +ssh-rsa
 ```
 
-Agora acesso qualquer VM com:
-
+Agora o acesso a qualquer VM é feito diretamente via:
 ```bash
 ssh wazuh
 ssh alvo
 ssh metasploitable
 ```
 
-## O que aprendi
+---
 
-- Diferença entre modos de rede em VMs (host-only vs NAT).
-- Como diagnosticar e corrigir IPs duplicados em interfaces de rede.
-- Como lidar com incompatibilidades de criptografia em sistemas legados.
-- Como organizar acessos SSH de forma prática e segura.
-- Importância de manter ambientes de teste isolados.
+## Principais Aprendizados
 
-## Próximos passos
+- Diagnóstico estruturado em camadas (Modelo OSI: Enlace/ARP, Rede/Roteamento IP, Transporte/Firewall e Aplicação/SSH).
+- Configuração de roteamento L3 no Windows (`IPEnableRouter`, `NetIPInterface Forwarding` e `NetNat`) integrando adaptadores físicos USB a redes virtuais *Host-Only*.
+- Gerenciamento de persistência de rotas no Linux com `Netplan`, `NetworkManager` e scripts `ifcfg` legados sem `NetworkManager` (vinculação de `HWADDR`/MAC).
+- Resolução de assimetria de rotas e conflitos entre `NetworkManager` e `systemd-networkd`.
 
-Este laboratório é a base do meu próximo projeto: **mini-SOC com detecção de força bruta SSH, regras customizadas no Wazuh e automação em Python**.
+## Próximos Passos
 
-## Aviso ético
+Este laboratório é a base do meu próximo projeto: **mini-SOC com detecção de força bruta SSH em tempo real, regras customizadas no Wazuh e resposta ativa automatizada em Python**.
+
+## Aviso Ético
 
 Todos os testes foram realizados exclusivamente em ambiente próprio, isolado e autorizado. Nenhum sistema de terceiros foi acessado ou testado.
+````[cite: 1, 4, 6, 7]
